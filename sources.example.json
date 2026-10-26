@@ -1,0 +1,19 @@
+{
+  "sources": [
+    {"provider": "claude", "path": "~/.claude/projects", "glob": "**/*.jsonl"},
+    {"provider": "codex", "path": "~/.codex/sessions", "glob": "**/rollout-*.jsonl*"},
+    {"provider": "codex", "path": "~/.codex/archived_sessions", "glob": "**/rollout-*.jsonl*"},
+    {"provider": "gemini", "path": "~/.gemini/tmp", "glob": "**/session-*.jsonl"},
+    {"provider": "chatgpt", "path": "~/Downloads/chatgpt-export", "glob": "conversations-*.json"},
+    {
+      "provider": "notes",
+      "path": "~/notes",
+      "glob": "**/*.md",
+      "exclude": ["drafts"],
+      "project": "notes",
+      "timezone": "Europe/Berlin",
+      "speakers": {"Me": "user", "Bot": "assistant"},
+      "provider_from_subfolder": ["claude", "codex", "gemini"]
+    }
+  ]
+}
