@@ -7,6 +7,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+import zstandard
 from store import DB, ROOT, connect, init, put_conversation, put_message, uid
 
 PARSER_VERSION = "2"
@@ -41,19 +42,33 @@ def import_chatgpt(c,path):
             put_message(c,cid,nodeid,seq,role,kind,msg.get("create_time"),body,path,f"/{ci}/mapping/{nodeid}",node.get("parent"),int(nodeid in active))
 
 
+def is_jsonl(path):
+    # Codex compresses sessions it has not touched for a while into .jsonl.zst and deletes the original.
+    return path.name.endswith((".jsonl",".jsonl.zst"))
+
+
 def jsonl_rows(path):
-    with path.open(encoding="utf-8") as f:
+    opener=(lambda: zstandard.open(path,"rt",encoding="utf-8")) if path.name.endswith(".zst") else (lambda: path.open(encoding="utf-8"))
+    good=0; bad=[]
+    with opener() as f:
         for line_no,line in enumerate(f,1):
             if not line.strip(): continue
-            try: yield line_no,json.loads(line)
+            try: row=json.loads(line)
             except json.JSONDecodeError:
                 # Active writers may leave an incomplete final record. Retry next sync.
-                if not line.endswith("\n"): return
-                raise ValueError(f"Invalid JSONL at {path}:{line_no}")
+                if not line.endswith("\n"): break
+                # A writer that crashed mid-record and then resumed leaves one broken line in the middle.
+                bad.append(line_no); continue
+            good+=1; yield line_no,row
+    if bad and not good:
+        raise ValueError(f"Invalid JSONL at {path}:{bad[0]}")
+    if bad:
+        print(f"SKIPPED broken lines in {path}: {','.join(map(str,bad[:20]))}",file=sys.stderr,flush=True)
 
 
 def import_jsonl(c,path,provider):
-    rows=jsonl_rows(path); cid=None; sid=path.stem; title=""; project=""
+    stem=path.name.removesuffix(".zst").removesuffix(".jsonl")
+    rows=jsonl_rows(path); cid=None; sid=stem; title=""; project=""
     # Codex rollout filenames contain a full UUID; metadata overrides this fallback.
     match=re.search(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",sid)
     if match: sid=match[0]
@@ -64,8 +79,8 @@ def import_jsonl(c,path,provider):
             sid=o["sessionId"]; project=o.get("projectHash","")
         elif provider=="claude":
             sid=o.get("sessionId",sid); project=o.get("cwd",project)
-            if "subagents" in path.parts and not sid.endswith("/"+path.stem):
-                sid += "/"+path.stem
+            if "subagents" in path.parts and not sid.endswith("/"+stem):
+                sid += "/"+stem
         if cid is None:
             cid=put_conversation(c,provider,sid,project=project,created=o.get("timestamp") or o.get("startTime"))
         timestamp=o.get("timestamp"); entries=[]; parent=None
@@ -159,6 +174,19 @@ def import_markdown(c,path,provider,spec=None):
     flush()
 
 
+def backfill_cjk(c,batch=2000):
+    """Index chunks imported before the CJK bigram index existed. Resumable: progress is saved per batch."""
+    meta=dict(c.execute("SELECT key,value FROM meta WHERE key IN ('cjk_backfill_until','cjk_backfill_done')").fetchall())
+    done,until=int(meta.get("cjk_backfill_done",0)),int(meta.get("cjk_backfill_until",0))
+    while done<until:
+        with c:
+            rows=c.execute("SELECT id,body FROM chunks WHERE id>? AND id<=? ORDER BY id LIMIT ?",(done,until,batch)).fetchall()
+            c.executemany("INSERT INTO cjk_index(rowid,body) VALUES(?,cjk_bigrams(?))",[(r[0],r[1]) for r in rows])
+            done=rows[-1][0] if rows else until
+            c.execute("INSERT OR REPLACE INTO meta VALUES('cjk_backfill_done',?)",(str(done),))
+        print(f"cjk index {done}/{until}",flush=True)
+
+
 def discover(config):
     seen=set()
     for spec in config["sources"]:
@@ -200,7 +228,7 @@ def run(config_path=ROOT/"sources.json",db=DB):
                     old_ids=c.execute("SELECT DISTINCT message_id FROM origins WHERE path=?",(str(p),)).fetchall()
                     c.execute("DELETE FROM origins WHERE path=?",(str(p),))
                     if provider=="chatgpt": import_chatgpt(c,p)
-                    elif p.suffix==".jsonl": import_jsonl(c,p,provider)
+                    elif is_jsonl(p): import_jsonl(c,p,provider)
                     else: import_markdown(c,p,provider,spec)
                     c.executemany("DELETE FROM messages WHERE id=? AND NOT EXISTS(SELECT 1 FROM origins o WHERE o.message_id=messages.id)",old_ids)
                     c.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?)",(str(p),provider,st.st_size,st.st_mtime_ns,datetime.now(timezone.utc).isoformat()))
@@ -209,6 +237,7 @@ def run(config_path=ROOT/"sources.json",db=DB):
                 if updated%20==0 or provider=="chatgpt": print(f"imported={updated} skipped={skipped} latest={p.name}",flush=True)
             except Exception as e:
                 failed+=1; print(f"FAILED {p}: {e}",file=sys.stderr,flush=True)
+        backfill_cjk(c)
         c.close()
         result={"updated":updated,"unchanged":skipped,"failed":failed}; print(json.dumps(result),flush=True)
         return result

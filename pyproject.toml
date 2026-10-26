@@ -2,5 +2,8 @@
 name = "history-search"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["mcp>=1.12,<2"]
+dependencies = [
+    "mcp>=1.12,<2",
+    "zstandard>=0.25.0",
+]
 

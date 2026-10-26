@@ -32,6 +32,55 @@ class HistoryTests(unittest.TestCase):
         self.assertTrue(store.search("",title="記憶設計",path=self.db)["results"])
         with self.assertRaises(ValueError): store.search("記憶",after="yesterday",path=self.db)
 
+    def test_two_character_cjk_uses_bigram_index(self):
+        cid=store.put_conversation(self.c,"claude","s2","t")
+        mid=store.put_message(self.c,cid,"1",1,"user","dialogue","2026-05-01T12:00:00Z","我們討論記憶整理的做法",self.root/"a.jsonl","line:1")
+        store.put_message(self.c,cid,"2",2,"user","dialogue","2026-05-01T12:00:01Z","記 憶 分開寫不算",self.root/"a.jsonl","line:2")
+        self.c.commit()
+        self.assertTrue(store.cjk_ready(self.c))
+        hits=store.search("記憶",path=self.db)["results"]
+        self.assertEqual([h["message_id"] for h in hits],[mid])
+        self.assertEqual(len(store.search("記憶 做法",path=self.db)["results"]),1)
+        self.assertFalse(store.search("憶做",path=self.db)["results"])
+        # Replacing a message's text removes its old bigrams.
+        store.put_message(self.c,cid,"1",1,"user","dialogue","2026-05-01T12:00:00Z","改成別的內容",self.root/"a.jsonl","line:1"); self.c.commit()
+        self.assertFalse(store.search("記憶",path=self.db)["results"])
+
+    def test_cjk_backfill_for_existing_database(self):
+        self.c.execute("DROP TRIGGER chunks_cjk_ai"); self.c.execute("DROP TRIGGER chunks_cjk_ad")
+        self.c.execute("DROP TABLE cjk_index"); self.c.execute("DELETE FROM meta"); self.c.commit()
+        cid=store.put_conversation(self.c,"claude","old","t")
+        store.put_message(self.c,cid,"1",1,"user","dialogue","2026-05-01T12:00:00Z","舊資料裡的記憶",self.root/"a.jsonl","line:1"); self.c.commit()
+        store.init(self.c)
+        self.assertFalse(store.cjk_ready(self.c))
+        self.assertTrue(store.search("記憶",path=self.db)["results"])   # still found by the slow path
+        imp.backfill_cjk(self.c,batch=1)
+        self.assertTrue(store.cjk_ready(self.c))
+        self.assertTrue(store.search("記憶",path=self.db)["results"])
+
+    def test_broken_line_in_the_middle_is_skipped(self):
+        p=self.root/"resumed.jsonl"
+        good={"type":"user","sessionId":"s","message":{"role":"user","content":"斷掉之前"}}
+        later={"type":"user","sessionId":"s","uuid":"u2","message":{"role":"user","content":"接著寫的內容"}}
+        p.write_text(json.dumps({**good,"uuid":"u1"})+"\n"+'{"type":"user","message":{"cont\n'+json.dumps(later)+"\n")
+        imp.import_jsonl(self.c,p,"claude"); self.c.commit()
+        self.assertTrue(store.search("斷掉之前",path=self.db)["results"])
+        hit=store.search("接著寫的內容",path=self.db)["results"][0]
+        self.assertEqual(hit["origins"][0]["locator"],"line:3")
+
+    def test_codex_zst_session(self):
+        import zstandard
+        rows=[{"type":"session_meta","payload":{"id":"zst-session","cwd":"/project"}},
+            {"type":"response_item","timestamp":"2026-09-06T10:00:00Z","payload":{"type":"message","role":"user","content":[{"text":"壓縮過的舊對話"}]}}]
+        p=self.root/"rollout-2026-09-06T12-30-15-zst.jsonl.zst"
+        p.write_bytes(zstandard.ZstdCompressor().compress(("\n".join(json.dumps(r) for r in rows)+"\n").encode()))
+        config=self.root/"sources.json"; config.write_text(json.dumps({"sources":[{"provider":"codex","path":str(self.root),"glob":"rollout-*.jsonl*"}]}))
+        self.assertEqual(imp.run(config,self.db)["updated"],1)
+        hit=store.search("壓縮過的舊對話",path=self.db)["results"][0]
+        self.assertEqual(hit["origins"][0]["locator"],"line:2")
+        self.assertTrue(hit["origins"][0]["path"].endswith(".jsonl.zst"))
+        self.assertEqual(hit["project"],"/project")
+
     def test_subagent_and_environment_separation(self):
         p=self.root/"env.jsonl"
         p.write_text("\n".join(json.dumps(o) for o in [

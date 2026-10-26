@@ -10,6 +10,16 @@ ROOT = Path(__file__).resolve().parent
 DB = ROOT / "data" / "history.sqlite3"
 
 
+# Han, kana and hangul. The trigram index cannot match terms shorter than three characters,
+# so CJK runs are also indexed as overlapping two-character tokens ("記憶整理" → 記憶 憶整 整理).
+CJK_RUN = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]{2,}")
+CJK_PAIR = re.compile(r"^[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]{2}$")
+
+
+def cjk_bigrams(text):
+    return " ".join(run[i:i+2] for run in CJK_RUN.findall(text or "") for i in range(len(run)-1))
+
+
 def uid(*parts):
     return hashlib.sha256("\0".join(map(str, parts)).encode()).hexdigest()[:32]
 
@@ -29,6 +39,7 @@ def connect(path=DB, write=False):
         path.parent.mkdir(parents=True, exist_ok=True)
         c = sqlite3.connect(path, timeout=60)
         c.execute("PRAGMA journal_mode=WAL")
+        c.create_function("cjk_bigrams", 1, cjk_bigrams, deterministic=True)
     else:
         c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
     c.row_factory = sqlite3.Row
@@ -50,7 +61,27 @@ def init(c):
     CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(body,content='chunks',content_rowid='id',tokenize='trigram');
     CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN INSERT INTO search_index(rowid,body) VALUES(new.id,new.body); END;
     CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN INSERT INTO search_index(search_index,rowid,body) VALUES('delete',old.id,old.body); END;
+    CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
     """)
+    if not c.execute("SELECT 1 FROM sqlite_master WHERE name='cjk_index'").fetchone():
+        # Chunks that exist before this index are filled in later by import_history.backfill_cjk.
+        c.executescript("""
+        CREATE VIRTUAL TABLE cjk_index USING fts5(body,content='',contentless_delete=1,tokenize='unicode61');
+        CREATE TRIGGER chunks_cjk_ai AFTER INSERT ON chunks BEGIN INSERT INTO cjk_index(rowid,body) VALUES(new.id,cjk_bigrams(new.body)); END;
+        CREATE TRIGGER chunks_cjk_ad AFTER DELETE ON chunks BEGIN DELETE FROM cjk_index WHERE rowid=old.id; END;
+        """)
+        top=c.execute("SELECT max(id) FROM chunks").fetchone()[0]
+        c.execute("INSERT OR REPLACE INTO meta VALUES('cjk_backfill_until',?)",(str(top or 0),))
+        c.execute("INSERT OR REPLACE INTO meta VALUES('cjk_backfill_done','0')")
+        c.commit()
+
+
+def cjk_ready(c):
+    try:
+        row=dict(c.execute("SELECT key,value FROM meta WHERE key IN ('cjk_backfill_until','cjk_backfill_done')").fetchall())
+    except sqlite3.OperationalError:
+        return False
+    return bool(row) and int(row.get("cjk_backfill_done","-1"))>=int(row.get("cjk_backfill_until","0"))
 
 
 def put_conversation(c, provider, native_id, title="", project="", created="", updated="", url=""):
@@ -106,7 +137,11 @@ def search(query, provider="", role="", project="", after="", before="", include
         rank="bm25(search_index)"
     else:
         join=""; rank="0.0"
+    pairs=[t for t in terms if CJK_PAIR.match(t)]
+    with connect(path) as c: use_pairs=bool(pairs) and not long and cjk_ready(c)
     for t in terms:
+        # A bigram token exists exactly when the two characters are adjacent in the text, so no recheck.
+        if use_pairs and t in pairs: continue
         where.append("instr(lower(k.body),lower(?))>0"); args.append(t)
     for column,value in [("v.provider",provider),("m.role",role)]:
         if value: where.append(column+"=?"); args.append(value)
@@ -118,6 +153,9 @@ def search(query, provider="", role="", project="", after="", before="", include
     if before: where.append("m.timestamp<?"); args.append(stamp(before))
     if not include_tools: where.append("m.kind IN ('dialogue','document')")
     with connect(path) as c:
+        if use_pairs:
+            where.insert(0,"k.id IN (SELECT rowid FROM cjk_index WHERE cjk_index MATCH ?)")
+            args.insert(0," AND ".join('"'+t+'"' for t in pairs))
         rows=c.execute(f"""SELECT m.id,k.body,k.offset,{rank} score FROM chunks k
           JOIN messages m ON m.id=k.message_id JOIN conversations v ON v.id=m.conversation_id {join}
           WHERE {' AND '.join(where)} ORDER BY score,m.timestamp DESC LIMIT ? OFFSET ?""",args+[limit+1,offset]).fetchall()
