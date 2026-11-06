@@ -1,9 +1,11 @@
 """Explicit, incremental imports; original records are never modified."""
 import argparse
 import fcntl
+import hashlib
 import json
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -47,44 +49,69 @@ def is_jsonl(path):
     return path.name.endswith((".jsonl",".jsonl.zst"))
 
 
-def jsonl_rows(path):
-    opener=(lambda: zstandard.open(path,"rt",encoding="utf-8")) if path.name.endswith(".zst") else (lambda: path.open(encoding="utf-8"))
+def plain_lines(path,mark):
+    """Whole lines from mark["offset"] on. An unfinished last line does not advance the mark: the writer is still on it."""
+    with path.open("rb") as f:
+        f.seek(mark["offset"])
+        for raw in f:
+            line_no=mark["line"]+1
+            if raw.endswith(b"\n"): mark.update(offset=mark["offset"]+len(raw),line=line_no)
+            yield line_no,raw.decode("utf-8",errors="replace")
+
+
+def jsonl_rows(path,mark=None):
+    mark=mark if mark is not None else {"offset":0,"line":0}
+    if path.name.endswith(".zst"):
+        def lines():
+            with zstandard.open(path,"rt",encoding="utf-8") as f: yield from enumerate(f,1)
+        numbered=lines()
+    else: numbered=plain_lines(path,mark)
     good=0; bad=[]
-    with opener() as f:
-        for line_no,line in enumerate(f,1):
-            if not line.strip(): continue
-            try: row=json.loads(line)
-            except json.JSONDecodeError:
-                # Active writers may leave an incomplete final record. Retry next sync.
-                if not line.endswith("\n"): break
-                # A writer that crashed mid-record and then resumed leaves one broken line in the middle.
-                bad.append(line_no); continue
-            good+=1; yield line_no,row
+    for line_no,line in numbered:
+        if not line.strip(): continue
+        try: row=json.loads(line)
+        except json.JSONDecodeError:
+            # Active writers may leave an incomplete final record. Retry next sync.
+            if not line.endswith("\n"): break
+            # A writer that crashed mid-record and then resumed leaves one broken line in the middle.
+            bad.append(line_no); continue
+        good+=1; yield line_no,row
     if bad and not good:
         raise ValueError(f"Invalid JSONL at {path}:{bad[0]}")
     if bad:
         print(f"SKIPPED broken lines in {path}: {','.join(map(str,bad[:20]))}",file=sys.stderr,flush=True)
 
 
-def import_jsonl(c,path,provider):
+def import_jsonl(c,path,provider,tail=None,spec=None):
+    """tail: where the last import stopped; only what was appended since is read. Returns the new stopping point."""
     stem=path.name.removesuffix(".zst").removesuffix(".jsonl")
-    rows=jsonl_rows(path); cid=None; sid=stem; title=""; project=""
+    tail=tail or {}
+    mark={"offset":tail.get("offset",0),"line":tail.get("line",0)}
+    rows=jsonl_rows(path,mark); cid=None; sid=tail.get("sid") or stem; title=tail.get("title",""); project=tail.get("project","")
     # Codex rollout filenames contain a full UUID; metadata overrides this fallback.
     match=re.search(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",sid)
-    if match: sid=match[0]
+    if match and not tail.get("sid"): sid=match[0]
     for line_no,o in rows:
         if provider=="codex" and o.get("type")=="session_meta":
             p=o.get("payload") or {}; sid=p.get("id",sid); project=p.get("cwd","")
         elif provider=="gemini" and o.get("sessionId"):
             sid=o["sessionId"]; project=o.get("projectHash","")
+        elif provider=="rooms":
+            sid=o.get("room_id",sid)
         elif provider=="claude":
             sid=o.get("sessionId",sid); project=o.get("cwd",project)
             if "subagents" in path.parts and not sid.endswith("/"+stem):
                 sid += "/"+stem
         if cid is None:
             cid=put_conversation(c,provider,sid,project=project,created=o.get("timestamp") or o.get("startTime"))
-        timestamp=o.get("timestamp"); entries=[]; parent=None
-        if provider=="codex":
+        timestamp=o.get("timestamp") or o.get("at"); entries=[]; parent=None
+        if provider=="rooms":
+            # The room log is the only record of what the user says on the room page; no session has it.
+            if o.get("type")=="post" and o.get("text"):
+                role="user" if o.get("from") in ((spec or {}).get("users") or ()) else "assistant"
+                entries=[(f"seq:{o.get('seq')}",role,"dialogue",f"[{sid} {o.get('from_name','')}] {o['text']}")]
+            title=title or f"room {sid}"
+        elif provider=="codex":
             p=o.get("payload") or {}; typ=p.get("type")
             if o.get("type")!="response_item": continue
             native=p.get("id") or f"line:{line_no}"
@@ -125,6 +152,7 @@ def import_jsonl(c,path,provider):
             if not title and role=="user" and kind=="dialogue": title=body.strip().split("\n")[0][:150]
             put_message(c,cid,native,line_no*1000+ei,role,kind,timestamp,body,path,f"line:{line_no}",parent)
         if entries: put_conversation(c,provider,sid,title,project,updated=timestamp)
+    return {**mark,"sid":sid,"project":project,"title":title}
 
 
 DEFAULT_SPEAKERS={"User":"user","Assistant":"assistant","Claude":"assistant","Codex":"assistant","Gemini":"assistant"}
@@ -201,15 +229,44 @@ def discover(config):
             seen.add(p); yield spec,p
 
 
-def run(config_path=ROOT/"sources.json",db=DB):
+TAILABLE=("claude","codex","gemini","rooms")
+
+
+def lock_import(lock,wait):
+    """A watcher holds the lock for moments at a time, so a manual refresh waits for its turn."""
+    deadline=time.monotonic()+wait
+    while True:
+        try: return fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:
+            if time.monotonic()>=deadline: raise RuntimeError("Another import is running")
+            time.sleep(0.5)
+
+
+def tail_guard(path,offset):
+    """The bytes just before the stopping point: if they changed, the file was rewritten, not appended to."""
+    with Path(path).open("rb") as f:
+        f.seek(max(0,offset-512)); return hashlib.sha256(f.read(min(512,offset))).hexdigest()
+
+
+def read_tail(c,path):
+    row=c.execute("SELECT offset,line,sid,project,title,guard FROM file_tails WHERE path=?",(path,)).fetchone()
+    if not row or tail_guard(path,row["offset"])!=row["guard"]: return None
+    return dict(row)
+
+
+def save_tail(c,path,got):
+    c.execute("INSERT OR REPLACE INTO file_tails VALUES(?,?,?,?,?,?,?)",(str(path),got["offset"],got["line"],got["sid"],got["project"],got["title"],tail_guard(path,got["offset"])))
+
+
+def run(config_path=ROOT/"sources.json",db=DB,only=None,wait=120):
     if not config_path.exists():
         raise SystemExit(f"{config_path} not found: copy sources.example.json to sources.json and edit the paths")
     config=json.loads(config_path.read_text()); db.parent.mkdir(parents=True,exist_ok=True)
     with (db.parent/"import.lock").open("a") as lock:
-        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError: raise RuntimeError("Another import is running")
+        lock_import(lock,wait)
         c=connect(db,write=True); init(c)
         c.execute("CREATE TABLE IF NOT EXISTS file_parsers(path TEXT PRIMARY KEY, version TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS file_tails(path TEXT PRIMARY KEY, offset INTEGER, line INTEGER, sid TEXT, project TEXT, title TEXT, guard TEXT)")
         with c:
             checkpoint_ids=c.execute("SELECT DISTINCT message_id FROM origins WHERE instr(path,'/.ipynb_checkpoints/')>0").fetchall()
             c.execute("DELETE FROM origins WHERE instr(path,'/.ipynb_checkpoints/')>0")
@@ -219,16 +276,28 @@ def run(config_path=ROOT/"sources.json",db=DB):
         updated=skipped=failed=0
         for spec,p in discover(config):
             provider=spec["provider"]
+            if only and provider not in only: continue
             st=p.stat(); old=c.execute("SELECT size,mtime FROM files WHERE path=?",(str(p),)).fetchone()
             version=c.execute("SELECT version FROM file_parsers WHERE path=?",(str(p),)).fetchone()
             expected_version="5" if p.suffix==".md" else PARSER_VERSION
             if old and tuple(old)==(st.st_size,st.st_mtime_ns) and version and version[0]==expected_version: skipped+=1; continue
+            tailable=provider in TAILABLE and p.name.endswith(".jsonl")
+            tail=read_tail(c,str(p)) if tailable and version and version[0]==expected_version and st.st_size>=(old[0] if old else 0) else None
             try:
+                if tail:
+                    with c:      # appended since last time: a session file can be hundreds of MB, read only the new part
+                        got=import_jsonl(c,p,provider,tail,spec)
+                        save_tail(c,p,got)
+                        c.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?)",(str(p),provider,st.st_size,st.st_mtime_ns,datetime.now(timezone.utc).isoformat()))
+                    updated+=1
+                    continue
                 with c:
                     old_ids=c.execute("SELECT DISTINCT message_id FROM origins WHERE path=?",(str(p),)).fetchall()
                     c.execute("DELETE FROM origins WHERE path=?",(str(p),))
                     if provider=="chatgpt": import_chatgpt(c,p)
-                    elif is_jsonl(p): import_jsonl(c,p,provider)
+                    elif is_jsonl(p):
+                        got=import_jsonl(c,p,provider,None,spec)
+                        if tailable: save_tail(c,p,got)
                     else: import_markdown(c,p,provider,spec)
                     c.executemany("DELETE FROM messages WHERE id=? AND NOT EXISTS(SELECT 1 FROM origins o WHERE o.message_id=messages.id)",old_ids)
                     c.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?)",(str(p),provider,st.st_size,st.st_mtime_ns,datetime.now(timezone.utc).isoformat()))
@@ -245,4 +314,11 @@ def run(config_path=ROOT/"sources.json",db=DB):
 
 if __name__=="__main__":
     p=argparse.ArgumentParser(); p.add_argument("--config",type=Path,default=ROOT/"sources.json"); p.add_argument("--db",type=Path,default=DB)
-    args=p.parse_args(); result=run(args.config,args.db); sys.exit(bool(result["failed"]))
+    p.add_argument("--watch",type=float,help="keep syncing session files and room logs every N seconds")
+    args=p.parse_args()
+    while args.watch:
+        try: run(args.config,args.db,only=TAILABLE,wait=0)
+        except RuntimeError: pass        # a manual import is running; next round
+        except Exception as e: print(f"WATCH {type(e).__name__}: {e}",file=sys.stderr,flush=True)
+        time.sleep(args.watch)
+    result=run(args.config,args.db); sys.exit(bool(result["failed"]))

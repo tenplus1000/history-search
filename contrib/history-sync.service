@@ -1,0 +1,15 @@
+# Keeps the archive current. Install: copy to ~/.config/systemd/user/, then
+#   systemctl --user daemon-reload && systemctl --user enable --now history-sync
+[Unit]
+Description=history-search live sync
+After=default.target
+
+[Service]
+ExecStart=%h/history-search/.venv/bin/python %h/history-search/import_history.py --watch 20
+Nice=10
+IOSchedulingClass=idle
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

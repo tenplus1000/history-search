@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 import store
 import import_history as imp
@@ -97,6 +98,64 @@ class HistoryTests(unittest.TestCase):
         imp.import_jsonl(self.c,p,"claude"); imp.import_jsonl(self.c,agent,"claude"); self.c.commit()
         hits=store.search("任務紀錄",path=self.db)["results"]
         self.assertEqual(len({h["conversation_id"] for h in hits}),2)
+
+    def sources(self,*specs):
+        path=self.root/"sources.json"; path.write_text(json.dumps({"sources":list(specs)})); return path
+
+    def test_appended_lines_are_read_without_rereading_the_file(self):
+        folder=self.root/"proj"; folder.mkdir(); p=folder/"session-a.jsonl"
+        row=lambda u,t: json.dumps({"type":"user","uuid":u,"sessionId":"s9","cwd":"/w","timestamp":"2026-11-07T01:00:00Z","message":{"role":"user","content":t}},ensure_ascii=False)+"\n"
+        p.write_text(row("a","第一句蔡老師"))
+        conf=self.sources({"provider":"claude","path":str(folder),"glob":"*.jsonl"}); db=self.root/"tail.sqlite3"
+        self.assertEqual(imp.run(conf,db)["updated"],1)
+        real=imp.json.loads; seen=[]
+        with p.open("a") as f: f.write(row("b","第二句相褒歌")); f.write('{"type":"user","uuid":"half')
+        with mock.patch.object(imp.json,"loads",side_effect=lambda t:(seen.append(t),real(t))[1]):
+            imp.run(conf,db,only=imp.TAILABLE)
+        self.assertFalse(any("第一句" in str(t) for t in seen))       # did not reread
+        hits=store.search("第二句",path=db)["results"]
+        self.assertEqual(len(hits),1)
+        self.assertEqual(hits[0]["title"],"第一句蔡老師")
+        with p.open("a") as f: f.write('","sessionId":"s9","message":{"role":"user","content":"第三句寫完了"}}\n')
+        imp.run(conf,db,only=imp.TAILABLE)
+        self.assertEqual(len(store.search("第三句",path=db)["results"]),1)
+        self.assertEqual(len(store.search("第一句",path=db)["results"]),1)     # nothing lost or doubled
+
+    def test_codex_session_id_survives_tail_import(self):
+        folder=self.root/"cx"; folder.mkdir(); p=folder/"rollout-1.jsonl"
+        meta=json.dumps({"type":"session_meta","payload":{"id":"real-id","cwd":"/w"}})+"\n"
+        msg=lambda t: json.dumps({"type":"response_item","timestamp":"2026-11-07T01:00:00Z","payload":{"type":"message","id":t,"role":"user","content":[{"type":"input_text","text":t}]}})+"\n"
+        p.write_text(meta+msg("早先那句"))
+        conf=self.sources({"provider":"codex","path":str(folder),"glob":"rollout-*.jsonl*"}); db=self.root/"cx.sqlite3"
+        imp.run(conf,db)
+        with p.open("a") as f: f.write(msg("後來那句"))
+        imp.run(conf,db,only=imp.TAILABLE)
+        with store.connect(db) as c:
+            self.assertEqual([r[0] for r in c.execute("SELECT native_id FROM conversations")],["real-id"])
+
+    def test_shrunk_file_is_imported_again_from_the_start(self):
+        folder=self.root/"shr"; folder.mkdir(); p=folder/"x.jsonl"
+        row=lambda u,t: json.dumps({"uuid":u,"sessionId":"s1","timestamp":"2026-11-07T01:00:00Z","message":{"role":"user","content":t}},ensure_ascii=False)+"\n"
+        p.write_text(row("a","很長很長的舊內容")+row("b","另一句舊內容"))
+        conf=self.sources({"provider":"claude","path":str(folder),"glob":"*.jsonl"}); db=self.root/"shr.sqlite3"
+        imp.run(conf,db)
+        p.write_text(row("c","新寫"))
+        imp.run(conf,db,only=imp.TAILABLE)
+        self.assertEqual(len(store.search("新寫",path=db)["results"]),1)
+        self.assertEqual(store.search("舊內容",path=db)["results"],[])
+
+    def test_room_log_finds_what_the_user_said_on_the_room_page(self):
+        folder=self.root/"rooms"; folder.mkdir(); p=folder/"R37.jsonl"
+        post=lambda seq,who,name,t: json.dumps({"seq":seq,"at":"2026-11-07T01:00:00+00:00","room_id":"R37","type":"post","from":who,"from_name":name,"text":t},ensure_ascii=False)+"\n"
+        p.write_text(post(1,"owner","本人","音樂頁改綠色")+post(2,"s1","結案","本人交代音樂頁")+json.dumps({"seq":3,"room_id":"R37","type":"joined"})+"\n")
+        conf=self.sources({"provider":"rooms","path":str(folder),"glob":"*.jsonl","users":["owner"]}); db=self.root/"room.sqlite3"
+        imp.run(conf,db)
+        got=store.search("音樂頁",role="user",path=db)["results"]
+        self.assertEqual(len(got),1)
+        self.assertIn("音樂頁改綠色",got[0]["excerpt"] if "excerpt" in got[0] else json.dumps(got[0],ensure_ascii=False))
+        with p.open("a") as f: f.write(post(4,"owner","本人","再改標題"))
+        imp.run(conf,db,only=imp.TAILABLE)
+        self.assertEqual(len(store.search("再改標題",provider="rooms",path=db)["results"]),1)
 
     def test_markdown_uuid_not_clock(self):
         p=self.root/"forum"/"claude"/"20260413_718b4f17.md"; p.parent.mkdir(parents=True)
